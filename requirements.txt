@@ -4,3 +4,4 @@ sqlalchemy==2.0.35
 python-multipart
 pywebpush==2.0.0
 python-dotenv==1.0.1
+psycopg2-binary==2.9.9
