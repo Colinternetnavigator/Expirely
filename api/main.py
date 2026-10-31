@@ -352,7 +352,9 @@ def parse_extra(doc: Document) -> dict:
 
 
 app = FastAPI(title="Nutify")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+import os
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
 
 BASE_CSS = """
 :root {
