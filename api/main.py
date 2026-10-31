@@ -178,6 +178,10 @@ class User(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
+    plan = Column(String, default="free", nullable=False)  # free | unlimited
+    email_verified = Column(Boolean, default=False, nullable=False)
+    verification_token = Column(String, nullable=True)
+    verification_expires = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
     documents = relationship("Document", back_populates="owner", cascade="all, delete-orphan")
     groups = relationship(
@@ -279,6 +283,22 @@ def ensure_schema():
                         conn.execute(text(f"ALTER TABLE documents ADD COLUMN {col} {typ}"))
                 except Exception as exc:
                     print(f"Could not add documents.{col}: {exc}")
+
+    if inspector.has_table("users"):
+        cols = [c["name"] for c in inspector.get_columns("users")]
+        user_additions = [
+            ("plan", "VARCHAR NOT NULL DEFAULT 'free'"),
+            ("email_verified", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("verification_token", "VARCHAR"),
+            ("verification_expires", "TIMESTAMP"),
+        ]
+        for col, typ in user_additions:
+            if col not in cols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {typ}"))
+                except Exception as exc:
+                    print(f"Could not add users.{col}: {exc}")
 
     if inspector.has_table("groups"):
         cols = [c["name"] for c in inspector.get_columns("groups")]
@@ -514,7 +534,25 @@ body {
   height:42px;
   object-fit:contain;
 }
-.nav { display:flex; gap:8px; flex-wrap:wrap; }
+.nav { display:none; }
+.hamburger { background:none; border:none; font-size:1.6rem; cursor:pointer; padding:8px; color:var(--accent-dark); }
+.menu-panel {
+  display:none; position:fixed; top:60px; right:12px; background:#fff;
+  border:1px solid var(--border); border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,.12);
+  z-index:30; min-width:180px; padding:8px 0;
+}
+.menu-panel.open { display:block; }
+.menu-panel a {
+  display:block; padding:12px 18px; text-decoration:none; color:var(--text); font-weight:600;
+}
+.menu-panel a:hover { background:#fff7ed; }
+.fab {
+  position:fixed; bottom:24px; right:24px; width:56px; height:56px; border-radius:50%;
+  background:var(--accent); color:#fff; font-size:2rem; font-weight:700;
+  display:flex; align-items:center; justify-content:center; text-decoration:none;
+  box-shadow:0 4px 12px rgba(249,115,22,.4); z-index:25;
+}
+.fab:hover { background:var(--accent-dark); }
 .nav a, .btn {
   text-decoration:none;
   padding:8px 14px;
@@ -731,19 +769,27 @@ label {
 """
 
 
-def page(title: str, body: str, user: Optional[User] = None) -> str:
+def page(title: str, body: str, user: Optional[User] = None, show_fab: bool = False) -> str:
     if user:
-        nav = (
-            '<a href="/dashboard" class="btn btn-outline btn-sm">Dashboard</a>'
-            '<a href="/add" class="btn btn-primary btn-sm">Add item</a>'
-            '<a href="/groups" class="btn btn-outline btn-sm">Groups</a>'
-            '<a href="/logout" class="btn btn-outline btn-sm">Logout</a>'
-        )
+        menu = f'''
+        <button class="hamburger" onclick="document.getElementById('menuPanel').classList.toggle('open')">☰</button>
+        <div class="menu-panel" id="menuPanel">
+          <a href="/dashboard">Dashboard</a>
+          <a href="/groups">Groups</a>
+          <a href="/upgrade">Upgrade</a>
+          <a href="/account">My account</a>
+          <a href="/logout">Logout</a>
+        </div>
+        '''
+        fab = '<a href="/add" class="fab" title="Add item">+</a>' if show_fab else ''
     else:
-        nav = (
-            '<a href="/login" class="btn btn-outline btn-sm">Login</a>'
-            '<a href="/register" class="btn btn-primary btn-sm">Register</a>'
-        )
+        menu = '''
+        <div class="nav">
+          <a href="/login" class="btn btn-outline btn-sm">Login</a>
+          <a href="/register" class="btn btn-primary btn-sm">Register</a>
+        </div>
+        '''
+        fab = ''
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -761,9 +807,10 @@ def page(title: str, body: str, user: Optional[User] = None) -> str:
       <img src="/brand-logo" alt="Nutify logo" onerror="this.style.display='none'">
       <span>Nutify</span>
     </a>
-    <div class="nav">{nav}</div>
+    {menu}
   </header>
   <div class="container">{body}</div>
+  {fab}
   <script>
   if ('serviceWorker' in navigator) {{
     navigator.serviceWorker.register('/sw.js').catch(() => {{}});
@@ -784,6 +831,13 @@ def page(title: str, body: str, user: Optional[User] = None) -> str:
   document.querySelectorAll('select[name="color"]').forEach(select => {{
     paintColourSelect(select);
     select.addEventListener('change', () => paintColourSelect(select));
+  }});
+
+  document.addEventListener('click', e => {{
+    const panel = document.getElementById('menuPanel');
+    if (panel && !panel.contains(e.target) && !e.target.closest('.hamburger')) {{
+      panel.classList.remove('open');
+    }}
   }});
   </script>
 </body>
@@ -829,19 +883,77 @@ def register_page(request: Request, db: Session = Depends(get_db)):
 
 @app.post("/register")
 def register(email: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == email.strip().lower()).first():
-        return RedirectResponse("/register", status_code=302)
+    email = email.strip().lower()
+    if db.query(User).filter(User.email == email).first():
+        return RedirectResponse("/register?error=exists", status_code=302)
 
-    user = User(email=email.strip().lower(), password_hash=hash_password(password))
+    token = secrets.token_urlsafe(32)
+    user = User(
+        email=email,
+        password_hash=hash_password(password),
+        plan="free",
+        email_verified=False,
+        verification_token=token,
+        verification_expires=datetime.utcnow() + timedelta(hours=24),
+    )
     db.add(user)
     db.commit()
-    token = create_session(db, user.id)
 
+    # Send verification email via Resend
+    api_key = os.getenv("RESEND_API_KEY")
+    from_email = os.getenv("FROM_EMAIL", "onboarding@resend.dev")
+    base_url = os.getenv("BASE_URL", "https://expirely-5pkx.onrender.com")
+    verify_url = f"{base_url}/verify?token={token}"
+
+    if api_key:
+        try:
+            import requests
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "from": from_email,
+                    "to": [email],
+                    "subject": "Verify your Nutify account",
+                    "html": f"<p>Click the link below to verify your account:</p><p><a href='{verify_url}'>Verify email</a></p><p>Or copy: {verify_url}</p>"
+                },
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                print(f"Resend error: {resp.text}")
+        except Exception as e:
+            print(f"Failed to send verification email: {e}")
+    else:
+        print(f"VERIFICATION LINK: {verify_url}")
+
+    return RedirectResponse("/verify-sent", status_code=302)
+
+
+@app.get("/verify-sent", response_class=HTMLResponse)
+def verify_sent():
+    body = """
+    <div class="card" style="text-align:center;">
+      <h2>Check your email</h2>
+      <p>We've sent a verification link. Click it to activate your account.</p>
+      <p class="hint">If you don't see it, check spam. The link expires in 24 hours.</p>
+    </div>
+    """
+    return page("Verify email", body)
+
+
+@app.get("/verify")
+def verify_email(token: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.verification_token == token).first()
+    if not user or not user.verification_expires or user.verification_expires < datetime.utcnow():
+        raise HTTPException(400, "Invalid or expired verification link")
+    user.email_verified = True
+    user.verification_token = None
+    user.verification_expires = None
+    db.commit()
+    # Auto-login after verify
+    session_token = create_session(db, user.id)
     resp = RedirectResponse("/dashboard", status_code=302)
-    resp.set_cookie(
-        "session_token", token, httponly=True,
-        max_age=30 * 24 * 3600, samesite="lax"
-    )
+    resp.set_cookie("session_token", session_token, httponly=True, max_age=30*24*3600, samesite="lax")
     return resp
 
 
@@ -926,6 +1038,52 @@ def _doc_row_html(d: Document, today: date, current_user_id: str) -> str:
     </div>
     """
 
+
+
+def is_unlimited(user: User) -> bool:
+    return user and user.plan == "unlimited"
+
+@app.get("/upgrade", response_class=HTMLResponse)
+def upgrade_page(request: Request, db: Session = Depends(get_db)):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse("/login")
+    body = """
+    <div class="card">
+      <h2>Upgrade to Unlimited</h2>
+      <p>Free plan: 3 push reminders, max 2 groups, colours only (default calendar dot).</p>
+      <h3>Unlimited includes</h3>
+      <ul>
+        <li>Unlimited push + email reminders</li>
+        <li>Unlimited groups</li>
+        <li>Custom calendar icons</li>
+        <li>Google Calendar sync</li>
+      </ul>
+      <p><strong>Monthly</strong> £0.89 / month</p>
+      <button onclick="alert('Google Play billing ready — connect later')">Subscribe monthly</button>
+      <p style="margin-top:16px;"><strong>Yearly</strong> £4.99 / year</p>
+      <button onclick="alert('Google Play billing ready — connect later')">Subscribe yearly</button>
+      <p class="hint" style="margin-top:20px;">Buttons are placeholders for Google Play Billing integration.</p>
+    </div>
+    """
+    return page("Upgrade", body, user)
+
+@app.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, db: Session = Depends(get_db)):
+    user = get_current_user(request, db)
+    if not user:
+        return RedirectResponse("/login")
+    verified = "Yes" if user.email_verified else "No"
+    body = f"""
+    <div class="card">
+      <h2>My account</h2>
+      <p><strong>Email:</strong> {html.escape(user.email)}</p>
+      <p><strong>Plan:</strong> {user.plan.title()}</p>
+      <p><strong>Email verified:</strong> {verified}</p>
+      <p class="hint">To send verification emails you need an email provider (Resend, SendGrid, etc.). Set SMTP or API keys as environment variables and call it from the register endpoint.</p>
+    </div>
+    """
+    return page("Account", body, user)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list", month: str = None):
@@ -1229,7 +1387,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
     </div>
     {list_html if view == "list" else cal_html}
     """
-    return page("Dashboard", body, user)
+    return page("Dashboard", body, user, show_fab=True)
 
 
 @app.get("/groups", response_class=HTMLResponse)
@@ -1328,7 +1486,7 @@ def groups_page(request: Request, db: Session = Depends(get_db)):
     {owned_html}
     {"<h3>Shared with you</h3>" + shared_html if shared_html else ""}
     """
-    return page("Groups", body, user)
+    return page("Groups", body, user, show_fab=True)
 
 
 @app.post("/groups")
@@ -1339,6 +1497,10 @@ def create_group(
     db: Session = Depends(get_db),
 ):
     user = require_user(request, db)
+    if not is_unlimited(user):
+        owned = db.query(Group).filter(Group.user_id == user.id, Group.parent_id == None).count()
+        if owned >= 2:
+            raise HTTPException(400, "Free plan limited to 2 groups. Upgrade for unlimited.")
     if color not in GROUP_COLORS:
         color = "#f97316"
 
@@ -1624,7 +1786,7 @@ async def create_document(request: Request, db: Session = Depends(get_db)):
 
     if color not in GROUP_COLORS:
         color = None
-    if icon not in ICON_MAP:
+    if icon not in ICON_MAP or not is_unlimited(user):
         icon = "dot"
 
     extra = {}
@@ -1787,7 +1949,7 @@ async def edit_document(doc_id: str, request: Request, db: Session = Depends(get
 
     if color not in GROUP_COLORS:
         color = None
-    if icon not in ICON_MAP:
+    if icon not in ICON_MAP or not is_unlimited(user):
         icon = "dot"
 
     extra = {}
@@ -1893,6 +2055,11 @@ def check_reminders(db: Session = Depends(get_db)):
         owner = db.query(User).filter(User.id == doc.user_id).first()
         if not owner:
             continue
+        if not is_unlimited(owner):
+            # Free plan: only remind on the first 3 documents
+            owned_docs = db.query(Document).filter(Document.user_id == owner.id).order_by(Document.created_at).all()
+            if doc.id not in [d.id for d in owned_docs[:3]]:
+                continue
 
         title = f"{doc.name} expires soon" if days_left >= 0 else f"{doc.name} has expired"
         body = (
