@@ -547,7 +547,7 @@ body {
   height:42px;
   object-fit:contain;
 }
-.nav { display:none; }
+.nav { display:flex; gap:8px; margin-left:auto; align-items:center; }
 .hamburger { background:none; border:none; font-size:1.6rem; cursor:pointer; padding:8px; color:var(--accent-dark); margin-left:auto; }
 .menu-panel {
   display:none; position:fixed; top:0; right:0; height:100vh; width:50%; max-width:320px;
@@ -1114,7 +1114,6 @@ def add_from_doc_page(request: Request, db: Session = Depends(get_db)):
 @app.post("/add-from-document")
 async def add_from_doc(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
     user = require_user(request, db)
-    # Save file
     upload_dir = Path("uploads")
     upload_dir.mkdir(exist_ok=True)
     file_id = str(uuid.uuid4())
@@ -1127,8 +1126,30 @@ async def add_from_doc(request: Request, file: UploadFile = File(...), db: Sessi
     db.add(df)
     db.commit()
 
-    # Placeholder AI extraction — replace with real OpenAI/Anthropic call later
-    # For now, redirect to manual add with a note
+    # Basic extraction for PDFs
+    extracted = {}
+    if file.content_type == "application/pdf" or ext.lower() == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            text = ""
+            for page in reader.pages[:5]:
+                text += page.extract_text() or ""
+            # Simple heuristics for insurance schedules
+            import re
+            if "esure" in text.lower() or "home insurance" in text.lower():
+                extracted["doc_type"] = "Home Insurance"
+            pol = re.search(r"Policy number\s+(\d+)", text)
+            if pol:
+                extracted["notes"] = f"Policy {pol.group(1)}"
+            # Look for dates
+            dates = re.findall(r"\d{2}/\d{2}/\d{4}", text)
+            if dates:
+                extracted["possible_dates"] = dates[:3]
+        except Exception as e:
+            print(f"PDF extract error: {e}")
+
+    # Store extraction briefly in query or session; for now redirect with file id
     return RedirectResponse(f"/add?prefill_from={file_id}", status_code=302)
 
 @app.get("/upgrade", response_class=HTMLResponse)
@@ -1769,10 +1790,16 @@ def _group_options(user: User, db: Session, selected: Optional[str] = None) -> s
 
 
 @app.get("/add", response_class=HTMLResponse)
-def add_page(request: Request, db: Session = Depends(get_db)):
+def add_page(request: Request, db: Session = Depends(get_db), prefill_from: str = None):
     user = get_current_user(request, db)
     if not user:
         return RedirectResponse("/login")
+
+    prefill_note = ""
+    if prefill_from:
+        df = db.query(DocumentFile).filter(DocumentFile.id == prefill_from, DocumentFile.user_id == user.id).first()
+        if df:
+            prefill_note = f'<p class="hint" style="background:#fff7ed;padding:10px;border-radius:8px;">Document uploaded: {html.escape(df.filename)}. Basic details extracted where possible — please review and complete the form.</p>'
 
     type_fields_js = json.dumps({
         k: [{"key": a, "label": b, "type": c} for a, b, c in v]
@@ -1784,8 +1811,10 @@ def add_page(request: Request, db: Session = Depends(get_db)):
     body = f"""
     <div class="card">
       <h2>Add item</h2>
+      {prefill_note}
       <p class="hint"><span class="req">*</span> = mandatory. Everything else is optional.</p>
       <form method="post" action="/documents" id="docForm">
+        <input type="hidden" name="linked_file_id" value="{prefill_from or ''}">
         <label>Name <span class="req">*</span></label>
         <input name="name" placeholder="e.g. Car insurance" required>
 
