@@ -110,8 +110,16 @@ TYPE_FIELDS = {
 }
 
 GROUP_COLORS = [
-    "#d97706", "#ea580c", "#f59e0b", "#b45309", "#92400e",
-    "#059669", "#0d9488", "#dc2626", "#7c3aed", "#64748b",
+    ("#d97706", "Amber"),
+    ("#ea580c", "Orange"),
+    ("#f59e0b", "Gold"),
+    ("#b45309", "Brown"),
+    ("#92400e", "Hazelnut"),
+    ("#059669", "Green"),
+    ("#0d9488", "Teal"),
+    ("#dc2626", "Red"),
+    ("#7c3aed", "Purple"),
+    ("#64748b", "Grey"),
 ]
 
 ICONS = [
@@ -318,9 +326,10 @@ def send_push_to_user(user: User, title: str, body: str, db: Session):
     db.commit()
 
 
-def color_option_html(c: str, selected: bool = False) -> str:
+def color_option_html(c: tuple, selected: bool = False) -> str:
+    hex_code, name = c
     sel = " selected" if selected else ""
-    return f'<option value="{c}"{sel} style="background:{c};color:#fff;">{c}</option>'
+    return f'<option value="{hex_code}"{sel} style="background:{hex_code};color:#fff;">{name}</option>'
 
 
 def icon_option_html(key: str, label: str, selected: bool = False) -> str:
@@ -353,8 +362,13 @@ def parse_extra(doc: Document) -> dict:
 
 app = FastAPI(title="Nutify")
 import os
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+STATIC_DIR = None
+for candidate in ["static", "Static", "../static", "api/static"]:
+    if os.path.isdir(candidate):
+        STATIC_DIR = candidate
+        break
+if STATIC_DIR:
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 BASE_CSS = """
 :root {
@@ -443,7 +457,7 @@ def page(title: str, body: str, user: Optional[User] = None) -> str:
 </head>
 <body>
   <header class="header">
-    <a href="/" class="logo"><img src="/static/Nutifylogo.png" alt="Nutify"> Nutify</a>
+    <a href="/" class="logo"><img src="/Static/Nutifylogo.png" alt="" onerror="this.style.display='none'"> Nutify</a>
     <div class="nav">{nav}</div>
   </header>
   <div class="container">{body}</div>
@@ -800,7 +814,7 @@ def groups_page(request: Request, db: Session = Depends(get_db)):
             ) + "</ul>"
         if is_owner:
             color_opts = "".join(
-                f'<option value="{c}" {"selected" if c == g.color else ""}>{c}</option>'
+                color_option_html(c, c[0] == g.color)
                 for c in GROUP_COLORS
             )
             owner_actions = f"""
@@ -1095,7 +1109,7 @@ def edit_document_page(doc_id: str, request: Request, db: Session = Depends(get_
         <label>Colour (only if not in a group)</label>
         <select name="color">
           <option value="">Use default / group colour</option>
-          {"".join(color_option_html(c, doc.color == c) for c in GROUP_COLORS)}
+          {"".join(color_option_html(c, doc.color == c[0]) for c in GROUP_COLORS)}
         </select>
         <label>Icon (shown on calendar)</label>
         <select name="icon">
@@ -1251,7 +1265,7 @@ def manifest():
         "display": "standalone",
         "background_color": "#fffbeb",
         "theme_color": "#d97706",
-        "icons": [{"src": "/static/Nutifylogo.png", "sizes": "192x192", "type": "image/png"}],
+        "icons": [{"src": "/Static/Nutifylogo.png", "sizes": "192x192", "type": "image/png"}],
     }
 
 
@@ -1263,7 +1277,7 @@ self.addEventListener('push', event => {
   event.waitUntil(
     self.registration.showNotification(data.title, {
       body: data.body,
-      icon: '/static/icon.png'
+      icon: '/Static/icon.png'
     })
   );
 });
