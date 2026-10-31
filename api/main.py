@@ -895,7 +895,15 @@ def logout(request: Request, db: Session = Depends(get_db)):
 
 def _doc_row_html(d: Document, today: date, current_user_id: str) -> str:
     days = (d.expiry_date.date() - today).days
-    cls = "expiry-soon" if days <= (d.reminder_days or 30) else "expiry-ok"
+    if days < 0:
+        cls = "expiry-soon"
+        expiry_text = f"Expired {d.expiry_date.strftime('%d %b %Y')} ({abs(days)}d ago)"
+    elif days <= (d.reminder_days or 30):
+        cls = "expiry-soon"
+        expiry_text = f"Expires {d.expiry_date.strftime('%d %b %Y')} ({days}d)"
+    else:
+        cls = "expiry-ok"
+        expiry_text = f"Expires {d.expiry_date.strftime('%d %b %Y')} ({days}d)"
     shared = "" if d.user_id == current_user_id else '<span class="chip">shared</span>'
     color = doc_color(d)
     symbol = ICON_MAP.get(d.icon or "dot", "●")
@@ -907,7 +915,7 @@ def _doc_row_html(d: Document, today: date, current_user_id: str) -> str:
         <span class="{icon_class}" style="color:{color};background:{color};display:inline-flex;vertical-align:middle;margin-right:6px;{'color:white;' if icon_class == 'cal-dot' else ''}">{html.escape(symbol)}</span>
         <strong>{html.escape(d.name)}</strong> {shared}
         <div class="meta">{html.escape(d.doc_type)}</div>
-        <span class="{cls}">Expires {d.expiry_date.strftime("%d %b %Y")} ({days}d)</span>
+        <span class="{cls}">{expiry_text}</span>
       </div>
       <div style="display:flex;gap:6px;flex-shrink:0;">
         <a href="/documents/{d.id}/edit" class="btn btn-outline btn-sm">Edit</a>
@@ -1062,7 +1070,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
                 tip = html.escape(f"{d.name} · {d.doc_type}", quote=True)
                 extra = parse_extra(d)
                 expired = d.expiry_date.date() < today
-                opacity = "opacity:0.55;" if expired else ""
+                opacity = "opacity:0.4;filter:grayscale(0.6);" if expired else ""
 
                 payload = safe_json_for_html({
                     "id": d.id,
@@ -1073,6 +1081,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
                     "extra": extra,
                     "color": colour,
                     "icon": icon_key,
+                    "expired": expired,
                 })
 
                 if icon_key == "dot":
@@ -1128,7 +1137,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
 
           const meta = document.createElement('div');
           meta.className = 'meta';
-          meta.textContent = d.type + ' · expires ' + d.expiry;
+          meta.textContent = d.type + ' · ' + (d.expired ? 'expired ' : 'expires ') + d.expiry;
           modal.appendChild(meta);
 
           if (d.notes) {{
