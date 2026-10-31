@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Response, Form
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Text, Boolean, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
@@ -246,6 +246,19 @@ class Document(Base):
     owner = relationship("User", back_populates="documents")
     group = relationship("Group", back_populates="documents")
 
+
+
+class DocumentFile(Base):
+    __tablename__ = "document_files"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    document_id = Column(String, ForeignKey("documents.id"), nullable=True)
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    file_path = Column(String, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+    user = relationship("User")
+    document = relationship("Document")
 
 class PushSubscription(Base):
     __tablename__ = "push_subscriptions"
@@ -535,24 +548,30 @@ body {
   object-fit:contain;
 }
 .nav { display:none; }
-.hamburger { background:none; border:none; font-size:1.6rem; cursor:pointer; padding:8px; color:var(--accent-dark); }
+.hamburger { background:none; border:none; font-size:1.6rem; cursor:pointer; padding:8px; color:var(--accent-dark); margin-left:auto; }
 .menu-panel {
-  display:none; position:fixed; top:60px; right:12px; background:#fff;
-  border:1px solid var(--border); border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,.12);
-  z-index:30; min-width:180px; padding:8px 0;
+  display:none; position:fixed; top:0; right:0; height:100vh; width:50%; max-width:320px;
+  background:#fff; border-left:1px solid var(--border); box-shadow:-4px 0 16px rgba(0,0,0,.12);
+  z-index:40; padding:20px 0; overflow-y:auto;
 }
 .menu-panel.open { display:block; }
 .menu-panel a {
-  display:block; padding:12px 18px; text-decoration:none; color:var(--text); font-weight:600;
+  display:block; padding:14px 24px; text-decoration:none; color:var(--text); font-weight:600; border-bottom:1px solid #f1f5f9;
 }
 .menu-panel a:hover { background:#fff7ed; }
+.menu-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.3); z-index:35; }
+.menu-overlay.open { display:block; }
 .fab {
   position:fixed; bottom:24px; right:24px; width:56px; height:56px; border-radius:50%;
   background:var(--accent); color:#fff; font-size:2rem; font-weight:700;
   display:flex; align-items:center; justify-content:center; text-decoration:none;
-  box-shadow:0 4px 12px rgba(249,115,22,.4); z-index:25;
+  box-shadow:0 4px 12px rgba(249,115,22,.4); z-index:25; border:none; cursor:pointer;
 }
 .fab:hover { background:var(--accent-dark); }
+.add-choice { display:none; position:fixed; bottom:90px; right:24px; background:#fff; border-radius:12px; box-shadow:0 4px 16px rgba(0,0,0,.15); z-index:26; padding:8px; }
+.add-choice.open { display:block; }
+.add-choice a { display:block; padding:12px 16px; text-decoration:none; color:var(--text); font-weight:600; border-radius:8px; }
+.add-choice a:hover { background:#fff7ed; }
 .nav a, .btn {
   text-decoration:none;
   padding:8px 14px;
@@ -772,16 +791,24 @@ label {
 def page(title: str, body: str, user: Optional[User] = None, show_fab: bool = False) -> str:
     if user:
         menu = f'''
-        <button class="hamburger" onclick="document.getElementById('menuPanel').classList.toggle('open')">☰</button>
+        <button class="hamburger" onclick="document.getElementById('menuPanel').classList.toggle('open');document.getElementById('menuOverlay').classList.toggle('open')">☰</button>
+        <div class="menu-overlay" id="menuOverlay" onclick="document.getElementById('menuPanel').classList.remove('open');this.classList.remove('open')"></div>
         <div class="menu-panel" id="menuPanel">
           <a href="/dashboard">Dashboard</a>
           <a href="/groups">Groups</a>
+          <a href="/documents">My documents</a>
           <a href="/upgrade">Upgrade</a>
           <a href="/account">My account</a>
           <a href="/logout">Logout</a>
         </div>
         '''
-        fab = '<a href="/add" class="fab" title="Add item">+</a>' if show_fab else ''
+        fab = '''
+        <button class="fab" onclick="document.getElementById('addChoice').classList.toggle('open')">+</button>
+        <div class="add-choice" id="addChoice">
+          <a href="/add">Add manually</a>
+          <a href="/add-from-document">Add from document</a>
+        </div>
+        ''' if show_fab else ''
     else:
         menu = '''
         <div class="nav">
@@ -1042,6 +1069,67 @@ def _doc_row_html(d: Document, today: date, current_user_id: str) -> str:
 
 def is_unlimited(user: User) -> bool:
     return user and user.plan == "unlimited"
+
+
+@app.get("/documents", response_class=HTMLResponse)
+def my_documents(request: Request, db: Session = Depends(get_db)):
+    user = require_user(request, db)
+    files = db.query(DocumentFile).filter(DocumentFile.user_id == user.id).order_by(DocumentFile.created_at.desc()).all()
+    rows = ""
+    for f in files:
+        rows += f'<div class="doc-row"><div><strong>{html.escape(f.filename)}</strong><div class="meta">{f.created_at.strftime("%d %b %Y")}</div></div><a href="/documents/{f.id}/download" class="btn btn-outline btn-sm">Download</a></div>'
+    body = f"""
+    <div class="card">
+      <h2>My documents</h2>
+      {rows or '<p class="hint">No documents uploaded yet.</p>'}
+    </div>
+    """
+    return page("My documents", body, user, show_fab=True)
+
+
+@app.get("/documents/{file_id}/download")
+def download_document(file_id: str, request: Request, db: Session = Depends(get_db)):
+    user = require_user(request, db)
+    df = db.query(DocumentFile).filter(DocumentFile.id == file_id, DocumentFile.user_id == user.id).first()
+    if not df or not Path(df.file_path).exists():
+        raise HTTPException(404)
+    return FileResponse(df.file_path, filename=df.filename)
+
+@app.get("/add-from-document", response_class=HTMLResponse)
+def add_from_doc_page(request: Request, db: Session = Depends(get_db)):
+    user = require_user(request, db)
+    body = """
+    <div class="card" style="max-width:480px;margin:20px auto;">
+      <h2>Add from document</h2>
+      <p class="hint">Upload a policy or document. AI will try to extract the key details.</p>
+      <form method="post" action="/add-from-document" enctype="multipart/form-data">
+        <label>Document file</label>
+        <input type="file" name="file" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
+        <button type="submit">Upload and scan</button>
+      </form>
+    </div>
+    """
+    return page("Add from document", body, user)
+
+@app.post("/add-from-document")
+async def add_from_doc(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    user = require_user(request, db)
+    # Save file
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(exist_ok=True)
+    file_id = str(uuid.uuid4())
+    ext = Path(file.filename).suffix or ".bin"
+    path = upload_dir / f"{file_id}{ext}"
+    content = await file.read()
+    path.write_bytes(content)
+
+    df = DocumentFile(id=file_id, user_id=user.id, filename=file.filename, content_type=file.content_type, file_path=str(path))
+    db.add(df)
+    db.commit()
+
+    # Placeholder AI extraction — replace with real OpenAI/Anthropic call later
+    # For now, redirect to manual add with a note
+    return RedirectResponse(f"/add?prefill_from={file_id}", status_code=302)
 
 @app.get("/upgrade", response_class=HTMLResponse)
 def upgrade_page(request: Request, db: Session = Depends(get_db)):
