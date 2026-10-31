@@ -235,6 +235,8 @@ class Document(Base):
     reminder_days = Column(Integer, default=30)
     color = Column(String, nullable=True)
     icon = Column(String, nullable=False, default="dot")
+    last_notified_at = Column(DateTime, nullable=True)
+    snooze_until = Column(DateTime, nullable=True)
     extra_data = Column(Text, nullable=True)
     created_at = Column(DateTime, default=func.now())
     owner = relationship("User", back_populates="documents")
@@ -266,6 +268,8 @@ def ensure_schema():
             ("color", "VARCHAR"),
             ("extra_data", "TEXT"),
             ("icon", "VARCHAR NOT NULL DEFAULT 'dot'"),
+            ("last_notified_at", "TIMESTAMP"),
+            ("snooze_until", "TIMESTAMP"),
         ]
 
         for col, typ in additions:
@@ -362,9 +366,12 @@ def get_user_documents(user: User, db: Session):
     return own + shared_docs
 
 
-def send_push_to_user(user: User, title: str, body: str, db: Session):
+def send_push_to_user(user: User, title: str, body: str, db: Session, extra: dict = None):
     if not HAS_PUSH:
         return
+    payload = {"title": title, "body": body}
+    if extra:
+        payload.update(extra)
     for sub in list(user.push_subscriptions):
         try:
             webpush(
@@ -372,7 +379,7 @@ def send_push_to_user(user: User, title: str, body: str, db: Session):
                     "endpoint": sub.endpoint,
                     "keys": {"p256dh": sub.p256dh, "auth": sub.auth},
                 },
-                data=json.dumps({"title": title, "body": body}),
+                data=json.dumps(payload),
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims=VAPID_CLAIMS,
             )
@@ -913,7 +920,7 @@ def _doc_row_html(d: Document, today: date, current_user_id: str) -> str:
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list"):
+def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list", month: str = None):
     user = get_current_user(request, db)
     if not user:
         return RedirectResponse("/login")
@@ -1005,28 +1012,47 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
 
     cal_html = ""
     if view == "calendar":
-        year, month = today.year, today.month
-        first = date(year, month, 1)
+        # Support ?month=YYYY-MM
+        if month:
+            try:
+                y, m = map(int, month.split("-"))
+                first = date(y, m, 1)
+            except Exception:
+                first = date(today.year, today.month, 1)
+        else:
+            first = date(today.year, today.month, 1)
+        year, mon = first.year, first.month
         start_pad = first.weekday()
 
-        if month == 12:
+        if mon == 12:
             next_m = date(year + 1, 1, 1)
         else:
-            next_m = date(year, month + 1, 1)
+            next_m = date(year, mon + 1, 1)
 
         days_in_month = (next_m - first).days
         by_day = defaultdict(list)
 
         for d in docs:
-            if d.expiry_date.year == year and d.expiry_date.month == month:
+            if d.expiry_date.year == year and d.expiry_date.month == mon:
                 by_day[d.expiry_date.day].append(d)
+
+        prev_first = first - timedelta(days=1)
+        prev_month_str = prev_first.replace(day=1).strftime("%Y-%m")
+        next_month_str = next_m.strftime("%Y-%m")
+        nav = f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <a href="/dashboard?view=calendar&month={prev_month_str}" class="btn btn-outline btn-sm">← Prev</a>
+          <h3 style="margin:0;">{first.strftime("%B %Y")}</h3>
+          <a href="/dashboard?view=calendar&month={next_month_str}" class="btn btn-outline btn-sm">Next →</a>
+        </div>
+        """
 
         cells = []
         for _ in range(start_pad):
             cells.append('<div class="cal-day other"></div>')
 
         for day in range(1, days_in_month + 1):
-            is_today = day == today.day
+            is_today = (year == today.year and mon == today.month and day == today.day)
             dots = ""
 
             for d in by_day.get(day, []):
@@ -1035,6 +1061,8 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
                 icon_key = d.icon or "dot"
                 tip = html.escape(f"{d.name} · {d.doc_type}", quote=True)
                 extra = parse_extra(d)
+                expired = d.expiry_date.date() < today
+                opacity = "opacity:0.55;" if expired else ""
 
                 payload = safe_json_for_html({
                     "id": d.id,
@@ -1050,7 +1078,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
                 if icon_key == "dot":
                     dots += (
                         f'<span class="cal-dot" '
-                        f'style="background:{colour};" '
+                        f'style="background:{colour};{opacity}" '
                         f'title="{tip}" role="button" tabindex="0" '
                         f'onclick=\'showDoc({payload})\' '
                         f'onkeydown="if(event.key===\'Enter\')showDoc({payload})"></span>'
@@ -1058,7 +1086,7 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
                 else:
                     dots += (
                         f'<span class="cal-icon" '
-                        f'style="color:{colour};" '
+                        f'style="color:{colour};{opacity}" '
                         f'title="{tip}" role="button" tabindex="0" '
                         f'onclick=\'showDoc({payload})\' '
                         f'onkeydown="if(event.key===\'Enter\')showDoc({payload})">'
@@ -1081,9 +1109,9 @@ def dashboard(request: Request, db: Session = Depends(get_db), view: str = "list
 
         cal_html = f"""
         <div class="card">
-          <h3 style="margin:0 0 12px;">{first.strftime("%B %Y")}</h3>
+          {nav}
           <div class="cal-grid">{heads}{''.join(cells)}</div>
-          <p class="hint" style="margin-top:12px;">Tap a dot or symbol for item details.</p>
+          <p class="hint" style="margin-top:12px;">Tap a dot or symbol for item details. Faded = expired.</p>
         </div>
         <div class="modal-bg" id="docModal" onclick="if(event.target===this)this.classList.remove('open')">
           <div class="modal" id="docModalBody"></div>
@@ -1835,24 +1863,55 @@ def test_push(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/admin/check-reminders")
 def check_reminders(db: Session = Depends(get_db)):
+    now = datetime.utcnow()
     today = date.today()
     docs = db.query(Document).all()
     sent = 0
 
     for doc in docs:
-        days_left = (doc.expiry_date.date() - today).days
-        if 0 <= days_left <= (doc.reminder_days or 30):
-            owner = db.query(User).filter(User.id == doc.user_id).first()
-            if owner:
-                send_push_to_user(
-                    owner,
-                    f"{doc.name} expires soon",
-                    f"{doc.name} ({doc.doc_type}) expires in {days_left} day(s)",
-                    db,
-                )
-                sent += 1
+        # Respect snooze
+        if doc.snooze_until and doc.snooze_until > now:
+            continue
 
+        days_left = (doc.expiry_date.date() - today).days
+        if days_left > (doc.reminder_days or 30):
+            continue
+
+        # Only notify once per day
+        if doc.last_notified_at and (now - doc.last_notified_at).total_seconds() < 20 * 3600:
+            continue
+
+        owner = db.query(User).filter(User.id == doc.user_id).first()
+        if not owner:
+            continue
+
+        title = f"{doc.name} expires soon" if days_left >= 0 else f"{doc.name} has expired"
+        body = (
+            f"{doc.name} ({doc.doc_type}) expires in {days_left} day(s)"
+            if days_left >= 0
+            else f"{doc.name} ({doc.doc_type}) expired {abs(days_left)} day(s) ago"
+        )
+        send_push_to_user(owner, title, body, db, extra={"doc_id": doc.id})
+        doc.last_notified_at = now
+        sent += 1
+
+    db.commit()
     return {"checked": len(docs), "reminders_sent": sent}
+
+
+@app.get("/documents/{doc_id}/snooze")
+def snooze_document(doc_id: str, hours: int = 1, request: Request = None, db: Session = Depends(get_db)):
+    user = get_current_user(request, db)
+    if not user:
+        raise HTTPException(401)
+    doc = db.query(Document).filter(Document.id == doc_id).first()
+    if not doc or doc.user_id != user.id:
+        raise HTTPException(404)
+    if hours not in (1, 4, 24):
+        hours = 1
+    doc.snooze_until = datetime.utcnow() + timedelta(hours=hours)
+    db.commit()
+    return {"ok": True, "snooze_until": doc.snooze_until.isoformat()}
 
 
 @app.get("/manifest.json")
@@ -1877,17 +1936,36 @@ self.addEventListener('push', event => {
     body: 'You have an item expiring soon'
   };
 
+  const options = {
+    body: data.body,
+    icon: '/brand-logo',
+    data: data,
+    actions: [
+      { action: 'snooze1', title: 'Snooze 1h' },
+      { action: 'snooze4', title: 'Snooze 4h' },
+      { action: 'snooze24', title: 'Snooze 24h' }
+    ]
+  };
+
   event.waitUntil(
-    self.registration.showNotification(data.title, {
-      body: data.body,
-      icon: '/brand-logo'
-    })
+    self.registration.showNotification(data.title, options)
   );
 });
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  event.waitUntil(clients.openWindow('/dashboard'));
+  const data = event.notification.data || {};
+  const docId = data.doc_id;
+
+  if (event.action && event.action.startsWith('snooze') && docId) {
+    const hours = event.action === 'snooze1' ? 1 : event.action === 'snooze4' ? 4 : 24;
+    event.waitUntil(
+      fetch('/documents/' + docId + '/snooze?hours=' + hours)
+        .then(() => clients.openWindow('/dashboard'))
+    );
+  } else {
+    event.waitUntil(clients.openWindow('/dashboard'));
+  }
 });
 """
     return Response(content=sw, media_type="application/javascript")
